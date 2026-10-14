@@ -111,7 +111,7 @@
           arr.push(doc);
           await _annoSave(db, base, doc.anno, arr);
           sessionStorage.removeItem(CACHE_KEY);
-          return { status: 'ok' };
+          return { status: 'ok', doc };
         }
 
         case 'update': {
@@ -389,12 +389,14 @@
       return;
     }
 
-    const dateObj       = new Date(data);
-    const mese          = dateObj.getMonth() + 1;
-    const anno          = dateObj.getFullYear();
+    const [anno, mese]  = data.split('-').map(Number);
     const tipo          = currentType === 'entrata' ? 'Entrate' : 'Uscite';
-    const costoNum      = parseFloat(costo.replace(',', '.'));
-    const costoFmt      = costoNum.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const costoNum      = parseImporto(costo);
+    if (isNaN(costoNum) || costoNum <= 0) {
+      showFeedback('⚠ Importo non valido (es. 42,50 o 1850).', 'error');
+      return;
+    }
+    const costoFmt      = fmtCostoStore(costoNum);
 
     const row = [data, costoFmt, descrizione, selectedCategory, tipo, mese, anno];
 
@@ -404,6 +406,8 @@
     try {
       const json = await asCall({ action: 'append', row: JSON.stringify(row) });
       if (json.status !== 'ok') throw new Error(json.message);
+      // Aggiorna i dati in memoria: elenco, dashboard e grafici la vedono subito
+      allRows.push({ ...json.doc, rowIndex: allRows.length + 1 });
       showFeedback('✓ Voce salvata correttamente.', 'success');
       resetForm();
     } catch(e) {
@@ -423,8 +427,6 @@
 
   let allRows = [];
   let sortDir = 'desc'; // default: più recente prima
-  let deleteTarget = null;
-  let bulkDeletePending = false;
   const selected = new Set(); // ord delle voci selezionate (stabile, a differenza di rowIndex)
   let visibleRows = [];
 
@@ -487,17 +489,7 @@
     patrimonioRows = json.patrimonio || [];
     ricorrentiRows = json.ricorrenti || [];
     loadingBanner.remove();
-    updateNotifiche();
-    const s = state.activeSection;
-    if (s === 'elenco')     { populateAnnoFilter(); applyFilters(); }
-    if (s === 'annuale')    renderDashAnnuale();
-    if (s === 'generale')   renderDashGenerale();
-    if (s === 'tabelle')    renderTabelle();
-    if (s === 'utenze')     renderUtenze();
-    if (s === 'mutuo')      buildMutuo(mAllRate);
-    if (s === 'cashflow')   renderCashflow();
-    if (s === 'patrimonio') renderPatrimonio();
-    if (s === 'calendario')  { renderCalendario(); }
+    renderActiveSection();
   }
 
   async function initApp(forceRefresh = false) {
@@ -536,9 +528,11 @@
 
   function populateAnnoFilter() {
     const fAnnoEl = document.getElementById('fAnno');
+    const prev = fAnnoEl.value; // conserva il filtro scelto dopo ricariche/modifiche
     const anni = [...new Set(allRows.map(r => r.anno).filter(Boolean))].sort((a,b) => b-a);
     fAnnoEl.innerHTML = '<option value="">Tutti</option>';
     anni.forEach(a => { const o = document.createElement('option'); o.value=a; o.textContent=a; fAnnoEl.appendChild(o); });
+    fAnnoEl.value = anni.includes(prev) ? prev : '';
   }
 
   function applyFilters() {
@@ -555,10 +549,10 @@
       return true;
     });
 
-    // Ordina per data
+    // Ordina per data (a parità di data, per ordine di inserimento)
     filtered.sort((a, b) => {
-      const da = new Date(a.data), db = new Date(b.data);
-      return sortDir === 'desc' ? db - da : da - db;
+      const c = String(a.data).localeCompare(String(b.data)) || (a.ord - b.ord);
+      return sortDir === 'desc' ? -c : c;
     });
 
     // La selezione resta limitata alle voci visibili: un'azione di gruppo
@@ -572,77 +566,63 @@
     updateBulkBar();
   }
 
-  // ─── Controlli di gruppo ──────────────────────────────────────
-  const bulkBar      = document.getElementById('bulkBar');
-  const bulkCatEl    = document.getElementById('bulkCategoria');
-  const bulkTipoEl   = document.getElementById('bulkTipo');
-  const btnBulkApply = document.getElementById('btnBulkApply');
-  const chkAll       = document.getElementById('chkAll');
-  TUTTE_CAT.forEach(c => { const o = document.createElement('option'); o.value=c; o.textContent=c; bulkCatEl.appendChild(o); });
+  // ─── Selezione + barra azioni flottante ───────────────────────
+  // Come School-manager: niente checkbox. Desktop: click sulla riga =
+  // seleziona/deseleziona, doppio click = modifica. Mobile: tap sulla
+  // maniglia = seleziona, tap altrove = espande il dettaglio.
+  const bulkBar = document.getElementById('bulkBar');
+  const isMobile = () => window.matchMedia('(max-width: 768px)').matches;
 
   function updateBulkBar() {
     const n = selected.size;
-    bulkBar.style.display = n ? 'flex' : 'none';
-    chkAll.checked = n > 0 && n === visibleRows.length;
-    chkAll.indeterminate = n > 0 && n < visibleRows.length;
+    bulkBar.classList.toggle('hidden', n === 0);
+    const allSel = visibleRows.length > 0 && visibleRows.every(r => selected.has(r.ord));
+    const btnAll = document.getElementById('btnBulkAll');
+    btnAll.classList.toggle('active', allSel);
+    btnAll.title = allSel ? 'Deseleziona tutto' : 'Seleziona tutte le voci filtrate';
     if (!n) return;
     const sel = visibleRows.filter(r => selected.has(r.ord));
-    // costo può essere "1.234,56" (it-IT) o "12.50"
-    const num = c => { c = String(c).trim(); return parseFloat(c.includes(',') ? c.replace(/\./g,'').replace(',','.') : c) || 0; };
-    const saldo = sel.reduce((s, r) => s + (r.tipo === 'Uscite' ? -1 : 1) * num(r.costo), 0);
-    document.getElementById('bulkCount').textContent = `${n} ${n === 1 ? 'selezionata' : 'selezionate'}`;
-    document.getElementById('bulkSum').textContent = `saldo ${saldo.toLocaleString('it-IT',{minimumFractionDigits:2,maximumFractionDigits:2})} €`;
-    btnBulkApply.disabled = !bulkCatEl.value && !bulkTipoEl.value;
+    const saldo = sel.reduce((s, r) => s + (r.tipo === 'Uscite' ? -1 : 1) * parseCosto(r.costo), 0);
+    document.getElementById('bulkCount').textContent = `${n} ${n === 1 ? 'voce selezionata' : 'voci selezionate'}`;
+    document.getElementById('bulkSum').textContent = (saldo >= 0 ? '+' : '−') + fmtEur(Math.abs(saldo));
+    document.getElementById('bulkSum').className = 'bulk-sum ' + (saldo >= 0 ? 'pos' : 'neg');
   }
 
-  chkAll.addEventListener('change', () => {
-    if (chkAll.checked) visibleRows.forEach(r => selected.add(r.ord));
-    else selected.clear();
-    speseBody.querySelectorAll('tr[data-ord]').forEach(tr => {
-      const on = selected.has(Number(tr.dataset.ord));
-      tr.classList.toggle('selected', on);
-      tr.querySelector('.row-check').checked = on;
-    });
+  function toggleSelect(tr, ord) {
+    if (selected.has(ord)) selected.delete(ord); else selected.add(ord);
+    tr.classList.toggle('selected', selected.has(ord));
+    updateBulkBar();
+  }
+
+  function clearSelection() {
+    selected.clear();
+    speseBody.querySelectorAll('tr.selected').forEach(tr => tr.classList.remove('selected'));
+    updateBulkBar();
+  }
+
+  document.getElementById('btnBulkAll').addEventListener('click', () => {
+    const allSel = visibleRows.length > 0 && visibleRows.every(r => selected.has(r.ord));
+    if (allSel) selected.clear(); else visibleRows.forEach(r => selected.add(r.ord));
+    speseBody.querySelectorAll('tr[data-ord]').forEach(tr => tr.classList.toggle('selected', selected.has(Number(tr.dataset.ord))));
     updateBulkBar();
   });
-
-  [bulkCatEl, bulkTipoEl].forEach(el => el.addEventListener('change', updateBulkBar));
-
-  document.getElementById('btnBulkClear').addEventListener('click', () => {
-    selected.clear();
-    applyFilters();
+  document.getElementById('btnBulkClear').addEventListener('click', clearSelection);
+  document.getElementById('btnBulkEdit').addEventListener('click', () => {
+    const rows = visibleRows.filter(r => selected.has(r.ord));
+    if (rows.length) openEditModal(rows);
   });
-
-  btnBulkApply.addEventListener('click', async () => {
-    const fields = {};
-    if (bulkCatEl.value)  fields.categoria = bulkCatEl.value;
-    if (bulkTipoEl.value) fields.tipo      = bulkTipoEl.value;
-    if (!selected.size || !Object.keys(fields).length) return;
-    const ords = [...selected];
-    btnBulkApply.disabled = true;
-    btnBulkApply.textContent = 'Salvataggio…';
-    try {
-      const json = await asCall({ action: 'update_many', ords: JSON.stringify(ords), fields: JSON.stringify(fields) });
-      if (json.status !== 'ok') throw new Error(json.message);
-      allRows.forEach(r => { if (selected.has(r.ord)) Object.assign(r, fields); });
-      bulkCatEl.value = ''; bulkTipoEl.value = '';
-      selected.clear();
-      applyFilters();
-    } catch(e) {
-      alert('Errore nel salvataggio. Riprova.');
-    } finally {
-      btnBulkApply.textContent = 'Applica';
-      updateBulkBar();
-    }
-  });
-
   document.getElementById('btnBulkDelete').addEventListener('click', () => {
-    if (!selected.size) return;
-    bulkDeletePending = true;
-    deleteTarget = null;
-    document.getElementById('modalTitle').textContent = `Eliminare ${selected.size} ${selected.size === 1 ? 'voce' : 'voci'}?`;
-    modalDesc.textContent = document.getElementById('bulkSum').textContent + ' — operazione non annullabile';
-    deleteModal.style.display = 'flex';
+    const rows = visibleRows.filter(r => selected.has(r.ord));
+    if (rows.length) askDeleteRows(rows);
+  });
+
+  // Esc: chiude la modale aperta, altrimenti svuota la selezione
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (csvReportModal.style.display === 'flex') { csvReportModal.style.display = 'none'; csvReport = null; return; }
+    if (editModal.style.display === 'flex') { editModal.style.display = 'none'; return; }
+    if (deleteModal.style.display === 'flex') { deleteModal.style.display = 'none'; deleteRows = null; return; }
+    if (state.activeSection === 'elenco' && selected.size) clearSelection();
   });
 
   // Sort click sul th Data
@@ -653,6 +633,8 @@
     th.classList.toggle('sort-desc', sortDir === 'desc');
     applyFilters();
   });
+
+  const GRIP_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="8" cy="6" r="1.6"/><circle cx="8" cy="12" r="1.6"/><circle cx="8" cy="18" r="1.6"/><circle cx="16" cy="6" r="1.6"/><circle cx="16" cy="12" r="1.6"/><circle cx="16" cy="18" r="1.6"/></svg>';
 
   function renderTable(rows) {
     tableLoading.style.display = 'none';
@@ -670,30 +652,17 @@
 
     rows.forEach(r => {
       const tr = document.createElement('tr');
-      tr.dataset.rowIndex = r.rowIndex;
       tr.dataset.ord = r.ord;
       const isUscita = r.tipo === 'Uscite';
-      const isSel = selected.has(r.ord);
-      if (isSel) tr.classList.add('selected');
-
-      const actionsHtml = `
-          <div class="td-actions">
-            <button class="btn-row edit" title="Modifica" onclick="startEdit(this, ${r.rowIndex})">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M9 2l2 2-7 7H2V9L9 2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
-            </button>
-            <button class="btn-row delete" title="Elimina" onclick="askDelete(${r.rowIndex})">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 3.5h9M5 3.5V2.5h3v1M4 3.5l.5 7h4l.5-7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>`;
+      if (selected.has(r.ord)) tr.classList.add('selected');
 
       tr.innerHTML = `
-        <td class="td-sel"><input type="checkbox" class="row-check" ${isSel ? 'checked' : ''}></td>
+        <td class="row-grip" title="Seleziona">${GRIP_SVG}</td>
         <td>${formatDataDisplay(r.data)}</td>
-        <td>${escHtml(r.descrizione)}</td>
+        <td title="${escHtml(r.descrizione)}">${escHtml(r.descrizione)}</td>
         <td><span class="tag tag-neutral">${escHtml(r.categoria)}</span></td>
         <td><span class="tag ${isUscita ? 'tag-red' : 'tag-green'}">${escHtml(r.tipo)}</span></td>
-        <td class="td-costo ${isUscita ? 'uscita' : 'entrata'}">${escHtml(r.costo)} €</td>
-        <td>${actionsHtml}</td>`;
+        <td class="td-costo ${isUscita ? 'uscita' : 'entrata'}">${fmtEur(parseCosto(r.costo))}</td>`;
       speseBody.appendChild(tr);
 
       // Riga dettaglio (visibile solo su mobile, espansa al tap sulla riga)
@@ -708,22 +677,25 @@
           <div class="m-detail-row">
             <span class="m-detail-label">Tipo</span>
             <span class="m-detail-val"><span class="tag ${isUscita ? 'tag-red' : 'tag-green'}">${escHtml(r.tipo)}</span></span>
-            <span class="m-detail-acts">${actionsHtml}</span>
           </div>
         </td>`;
       speseBody.appendChild(trD);
 
-      tr.querySelector('.row-check').addEventListener('change', (e) => {
-        if (e.target.checked) selected.add(r.ord); else selected.delete(r.ord);
-        tr.classList.toggle('selected', e.target.checked);
-        updateBulkBar();
-      });
-
       tr.addEventListener('click', (e) => {
-        if (!window.matchMedia('(max-width: 768px)').matches) return;
-        if (e.target.closest('button, .td-sel') || tr.classList.contains('editing')) return;
-        tr.classList.toggle('m-open');
-        trD.classList.toggle('m-visible');
+        if (isMobile() && !e.target.closest('.row-grip')) {
+          tr.classList.toggle('m-open');
+          trD.classList.toggle('m-visible');
+          return;
+        }
+        toggleSelect(tr, r.ord);
+      });
+      tr.addEventListener('dblclick', () => {
+        if (isMobile()) return;
+        window.getSelection()?.removeAllRanges();
+        selected.clear(); selected.add(r.ord);
+        speseBody.querySelectorAll('tr[data-ord]').forEach(x => x.classList.toggle('selected', x === tr));
+        updateBulkBar();
+        openEditModal([r]);
       });
     });
   }
@@ -734,115 +706,153 @@
     if (p.length === 3) return `${p[2]}/${p[1]}/${p[0]}`;
     return d;
   }
-  function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  function escHtml(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-  // ─── Modifica inline ──────────────────────────────────────────
-  window.startEdit = function(btn, rowIndex) {
-    const tr = document.querySelector(`tr[data-row-index="${rowIndex}"]`);
-    if (!tr || tr.classList.contains('editing')) return;
-    const row = allRows.find(r => r.rowIndex === rowIndex);
-    if (!row) return;
-    tr.classList.add('editing');
+  // Dopo una modifica i dati in memoria sono già aggiornati: ridisegna la
+  // sezione attiva (elenco, dashboard, tabelle, calendario…)
+  function renderActiveSection() {
+    const s = state.activeSection;
+    if (s === 'elenco')     { populateAnnoFilter(); applyFilters(); }
+    if (s === 'annuale')    renderDashAnnuale();
+    if (s === 'generale')   renderDashGenerale();
+    if (s === 'tabelle')    renderTabelle();
+    if (s === 'utenze')     renderUtenze();
+    if (s === 'mutuo')      buildMutuo(mAllRate);
+    if (s === 'cashflow')   renderCashflow();
+    if (s === 'patrimonio') renderPatrimonio();
+    if (s === 'calendario') renderCalendario();
+    updateNotifiche();
+  }
 
-    // Mobile: chiudi la riga dettaglio mentre si modifica
-    tr.classList.remove('m-open');
-    const nx = tr.nextElementSibling;
-    if (nx && nx.classList.contains('m-detail')) nx.classList.remove('m-visible');
+  // ─── Modale modifica (1 voce: tutti i campi; più voci: categoria/tipo) ──
+  const editModal = document.getElementById('editModal');
+  let editRows = null;
 
-    const allCat = [...CATEGORIE.uscita.principali, ...CATEGORIE.uscita.extra, ...CATEGORIE.entrata.principali].filter((v,i,a)=>a.indexOf(v)===i).sort();
-    const catOpts = allCat.map(c => `<option value="${c}" ${c===row.categoria?'selected':''}>${c}</option>`).join('');
-    const tipoOpts = ['Uscite','Entrate'].map(t => `<option value="${t}" ${t===row.tipo?'selected':''}>${t}</option>`).join('');
+  function openEditModal(rows) {
+    editRows = rows;
+    const single = rows.length === 1;
+    const r = rows[0];
+    const catEl  = document.getElementById('emCategoria');
+    const tipoEl = document.getElementById('emTipo');
+    const keep = single ? '' : '<option value="">— invariato —</option>';
+    const cats = [...TUTTE_CAT];
+    if (single && r.categoria && !cats.includes(r.categoria)) cats.unshift(r.categoria);
+    catEl.innerHTML  = keep + cats.map(c => `<option value="${escHtml(c)}">${escHtml(c)}</option>`).join('');
+    tipoEl.innerHTML = keep + '<option value="Uscite">Uscite</option><option value="Entrate">Entrate</option>';
 
-    // cells[0] = checkbox di selezione, resta invariata
-    tr.cells[1].innerHTML = `<input class="inline-input" id="ei-data-${rowIndex}" type="date" value="${row.data}" style="width:130px">`;
-    tr.cells[2].innerHTML = `<input class="inline-input" id="ei-desc-${rowIndex}" type="text" value="${escHtml(row.descrizione)}" style="min-width:140px">`;
-    tr.cells[3].innerHTML = `<select class="inline-select" id="ei-cat-${rowIndex}">${catOpts}</select>`;
-    tr.cells[4].innerHTML = `<select class="inline-select" id="ei-tipo-${rowIndex}">${tipoOpts}</select>`;
-    tr.cells[5].innerHTML = `<input class="inline-input" id="ei-costo-${rowIndex}" type="text" value="${row.costo}" style="width:80px;text-align:right">`;
-    tr.cells[6].innerHTML = `
-      <div class="td-actions">
-        <button class="btn-row save" title="Salva" onclick="saveEdit(${rowIndex})">
-          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 7l3.5 3.5L11 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <button class="btn-row cancel" title="Annulla" onclick="cancelEdit(${rowIndex})">
-          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M3 3l7 7M10 3l-7 7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-        </button>
-      </div>`;
-  };
-
-  window.cancelEdit = function(rowIndex) {
-    applyFilters();
-  };
-
-  window.saveEdit = async function(rowIndex) {
-    const data       = document.getElementById(`ei-data-${rowIndex}`).value;
-    const desc       = document.getElementById(`ei-desc-${rowIndex}`).value;
-    const cat        = document.getElementById(`ei-cat-${rowIndex}`).value;
-    const tipo       = document.getElementById(`ei-tipo-${rowIndex}`).value;
-    const costoRaw   = document.getElementById(`ei-costo-${rowIndex}`).value.replace(',','.');
-
-    const dateObj  = new Date(data);
-    const mese     = dateObj.getMonth() + 1;
-    const anno     = dateObj.getFullYear();
-    const costoFmt = parseFloat(costoRaw).toLocaleString('it-IT',{minimumFractionDigits:2,maximumFractionDigits:2});
-
-    try {
-      const json = await asCall({ action: 'update', rowIndex, row: JSON.stringify([data, costoFmt, desc, cat, tipo, mese, anno]) });
-      if (json.status !== 'ok') throw new Error(json.message);
-      const idx = allRows.findIndex(r => r.rowIndex === rowIndex);
-      if (idx > -1) allRows[idx] = { ...allRows[idx], data, costo: costoFmt, descrizione: desc, categoria: cat, tipo, mese: String(mese), anno: String(anno) };
-      applyFilters();
-    } catch(e) {
-      alert('Errore nel salvataggio. Riprova.');
+    document.getElementById('emTitle').textContent = single ? 'Modifica voce' : `Modifica ${rows.length} voci`;
+    document.getElementById('emSub').textContent = single ? '' : 'I campi lasciati su "invariato" non vengono toccati.';
+    document.getElementById('emSingleFields').style.display = single ? '' : 'none';
+    if (single) {
+      document.getElementById('emData').value  = r.data;
+      document.getElementById('emDesc').value  = r.descrizione;
+      document.getElementById('emCosto').value = parseCosto(r.costo).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false });
+      catEl.value  = r.categoria;
+      tipoEl.value = r.tipo;
+    } else {
+      catEl.value = ''; tipoEl.value = '';
     }
+    document.getElementById('emFeedback').className = 'form-feedback';
+    editModal.style.display = 'flex';
+    if (single) document.getElementById('emDesc').focus();
+  }
+
+  function emError(msg) {
+    const fb = document.getElementById('emFeedback');
+    fb.textContent = msg;
+    fb.className = 'form-feedback visible error';
+  }
+
+  document.getElementById('emAnnulla').addEventListener('click', () => { editModal.style.display = 'none'; editRows = null; });
+
+  document.getElementById('emSalva').addEventListener('click', async () => {
+    if (!editRows) return;
+    const btn = document.getElementById('emSalva');
+    const cat  = document.getElementById('emCategoria').value;
+    const tipo = document.getElementById('emTipo').value;
+
+    let params, applyLocal;
+    if (editRows.length === 1) {
+      const r     = editRows[0];
+      const data  = document.getElementById('emData').value;
+      const desc  = document.getElementById('emDesc').value.trim();
+      const costo = parseImporto(document.getElementById('emCosto').value);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(data)) return emError('Data non valida.');
+      if (!desc) return emError('La descrizione è obbligatoria.');
+      if (isNaN(costo) || costo < 0) return emError('Importo non valido (es. 1850,00).');
+      const [anno, mese] = data.split('-').map(Number);
+      const costoFmt = fmtCostoStore(costo);
+      params = { action: 'update', rowIndex: r.rowIndex, row: JSON.stringify([data, costoFmt, desc, cat, tipo, mese, anno]) };
+      applyLocal = () => Object.assign(r, { data, costo: costoFmt, descrizione: desc, categoria: cat, tipo, mese: String(mese), anno: String(anno) });
+    } else {
+      const fields = {};
+      if (cat)  fields.categoria = cat;
+      if (tipo) fields.tipo      = tipo;
+      if (!Object.keys(fields).length) return emError('Scegli almeno una categoria o un tipo.');
+      const ords = new Set(editRows.map(r => r.ord));
+      params = { action: 'update_many', ords: JSON.stringify([...ords]), fields: JSON.stringify(fields) };
+      applyLocal = () => allRows.forEach(r => { if (ords.has(r.ord)) Object.assign(r, fields); });
+    }
+
+    btn.disabled = true; btn.textContent = 'Salvataggio…';
+    try {
+      const json = await asCall(params);
+      if (json.status !== 'ok') throw new Error(json.message);
+      applyLocal();
+      editModal.style.display = 'none';
+      editRows = null;
+      selected.clear();
+      renderActiveSection();
+    } catch(e) {
+      emError('Errore nel salvataggio: ' + e.message);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Salva';
+    }
+  });
+
+  // Invio nei campi = Salva
+  editModal.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT') document.getElementById('emSalva').click();
+  });
+
+  // Usata dal calendario: apre la modale per una singola voce
+  window.startEdit = function(_btn, rowIndex) {
+    const r = allRows.find(x => x.rowIndex === rowIndex);
+    if (r) openEditModal([r]);
   };
 
-  // ─── Eliminazione ─────────────────────────────────────────────
-  window.askDelete = function(rowIndex) {
-    const r = allRows.find(row => row.rowIndex === rowIndex);
-    deleteTarget = rowIndex;
-    bulkDeletePending = false;
-    document.getElementById('modalTitle').textContent = 'Eliminare questa voce?';
-    modalDesc.textContent = r ? `"${r.descrizione}" — ${r.costo} €` : '';
+  // ─── Eliminazione (una o più voci) ────────────────────────────
+  let deleteRows = null;
+
+  function askDeleteRows(rows) {
+    deleteRows = rows;
+    const n = rows.length;
+    document.getElementById('modalTitle').textContent = n === 1 ? 'Eliminare questa voce?' : `Eliminare ${n} voci?`;
+    modalDesc.textContent = n === 1
+      ? `"${rows[0].descrizione}" — ${fmtEur(parseCosto(rows[0].costo))}`
+      : `Saldo delle voci selezionate: ${document.getElementById('bulkSum').textContent}. L'operazione non è annullabile.`;
     deleteModal.style.display = 'flex';
-  };
+  }
 
   document.getElementById('btnCancelDelete').addEventListener('click', () => {
     deleteModal.style.display = 'none';
-    deleteTarget = null;
-    bulkDeletePending = false;
+    deleteRows = null;
   });
 
   document.getElementById('btnConfirmDelete').addEventListener('click', async () => {
-    if (bulkDeletePending) {
-      bulkDeletePending = false;
-      deleteModal.style.display = 'none';
-      const ords = new Set(selected);
-      try {
-        const json = await asCall({ action: 'delete_many', ords: JSON.stringify([...ords]) });
-        if (json.status !== 'ok') throw new Error(json.message);
-        allRows = allRows.filter(r => !ords.has(r.ord));
-        allRows.forEach((r, i) => { r.rowIndex = i + 1; });
-        selected.clear();
-        applyFilters();
-      } catch(e) {
-        alert('Errore nell\'eliminazione. Riprova.');
-      }
-      return;
-    }
-    if (!deleteTarget) return;
-    const rowIndex = deleteTarget;
+    if (!deleteRows) return;
+    const ords = new Set(deleteRows.map(r => r.ord));
     deleteModal.style.display = 'none';
-    deleteTarget = null;
-
+    deleteRows = null;
     try {
-      const json = await asCall({ action: 'delete', rowIndex });
+      const json = await asCall({ action: 'delete_many', ords: JSON.stringify([...ords]) });
       if (json.status !== 'ok') throw new Error(json.message);
-      allRows = allRows.filter(r => r.rowIndex !== rowIndex);
-      allRows.forEach(r => { if (r.rowIndex > rowIndex) r.rowIndex--; });
-      applyFilters();
+      allRows = allRows.filter(r => !ords.has(r.ord));
+      allRows.forEach((r, i) => { r.rowIndex = i + 1; });
+      selected.clear();
+      renderActiveSection();
     } catch(e) {
-      alert('Errore nell\'eliminazione. Riprova.');
+      alert('Errore nell\'eliminazione: ' + e.message);
     }
   });
 
@@ -884,9 +894,10 @@
     return val.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
   }
 
+  // I costi in archivio possono essere "1.850,00" (it-IT, formato con cui
+  // l'app salva) o "1850.00" (dati storici): parseFloat diretto dava 1.85
   function parseCosto(s) {
-    if (!s) return 0;
-    return parseFloat(String(s).trim()) || 0;
+    return parseImporto(s) || 0;
   }
 
   function getDashFilters() {
@@ -2444,7 +2455,7 @@
     rowsAnno.forEach(r => {
       const m = parseInt(r.mese) - 1;
       if (m < 0 || m > 11) return;
-      const v = parseFloat(String(r.costo).replace(',','.')) || 0;
+      const v = parseCosto(r.costo);
       if (r.tipo === 'Entrate') entratePerMese[m] += v;
       else uscitePerMese[m] += v;
     });
@@ -2466,7 +2477,7 @@
     // ── Top 5 categorie uscite ──
     const catUsc = {};
     rowsAnno.filter(r => r.tipo !== 'Entrate').forEach(r => {
-      const v = parseFloat(String(r.costo).replace(',','.')) || 0;
+      const v = parseCosto(r.costo);
       catUsc[r.categoria] = (catUsc[r.categoria] || 0) + v;
     });
     const top5Usc = Object.entries(catUsc).sort((a,b) => b[1]-a[1]).slice(0,5);
@@ -2476,7 +2487,7 @@
     // ── Top 5 categorie entrate ──
     const catEnt = {};
     rowsAnno.filter(r => r.tipo === 'Entrate').forEach(r => {
-      const v = parseFloat(String(r.costo).replace(',','.')) || 0;
+      const v = parseCosto(r.costo);
       catEnt[r.categoria] = (catEnt[r.categoria] || 0) + v;
     });
     const top5Ent = Object.entries(catEnt).sort((a,b) => b[1]-a[1]).slice(0,5);
@@ -2792,8 +2803,8 @@
     const oggi = new Date();
     for (let d = 1; d <= daysInMonth; d++) {
       const spese = speseDelMese[d] || [];
-      const totUsc = spese.filter(r => r.tipo === 'Uscite').reduce((s,r) => s + (parseFloat(String(r.costo).replace(',','.')) || 0), 0);
-      const totEnt = spese.filter(r => r.tipo === 'Entrate').reduce((s,r) => s + (parseFloat(String(r.costo).replace(',','.')) || 0), 0);
+      const totUsc = spese.filter(r => r.tipo === 'Uscite').reduce((s,r) => s + (parseCosto(r.costo)), 0);
+      const totEnt = spese.filter(r => r.tipo === 'Entrate').reduce((s,r) => s + (parseCosto(r.costo)), 0);
       const isOggi = oggi.getDate()===d && oggi.getMonth()===calMonth && oggi.getFullYear()===calYear;
 
       let dotHtml = '';
@@ -2865,18 +2876,11 @@
     if (inp) inp.value = date;
   };
 
-  // Click su una voce del popup → vai all'elenco e apri la modifica inline
+  // Click su una voce del popup → apre la modale di modifica (resta sul
+  // calendario, che si ridisegna dopo il salvataggio)
   window.calEditSpesa = function(rowIndex) {
     document.getElementById('calPopup').style.display = 'none';
-    showSection('elenco');
-    // Azzera i filtri così la voce è sicuramente visibile
-    ['fAnno','fMese','fTipo','fCategoria'].forEach(id => { document.getElementById(id).value = ''; });
-    applyFilters();
-    const tr = document.querySelector(`tr[data-row-index="${rowIndex}"]`);
-    if (tr) {
-      tr.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      window.startEdit(null, rowIndex);
-    }
+    window.startEdit(null, rowIndex);
   };
 
   function renderCalChart() {
@@ -2904,8 +2908,8 @@
         const d = new Date(r.data);
         return d.getFullYear() === y && d.getMonth() === m;
       });
-      dataEnt.push(mRows.filter(r => r.tipo === 'Entrate').reduce((s,r) => s + (parseFloat(String(r.costo).replace(',','.')) || 0), 0));
-      dataUsc.push(mRows.filter(r => r.tipo === 'Uscite').reduce((s,r)  => s + (parseFloat(String(r.costo).replace(',','.')) || 0), 0));
+      dataEnt.push(mRows.filter(r => r.tipo === 'Entrate').reduce((s,r) => s + (parseCosto(r.costo)), 0));
+      dataUsc.push(mRows.filter(r => r.tipo === 'Uscite').reduce((s,r)  => s + (parseCosto(r.costo)), 0));
       cur.setMonth(cur.getMonth() + 1);
     }
 
@@ -2941,7 +2945,7 @@
     // Aggrega spese totali per giorno
     const spesaPerGiorno = {};
     allRows.filter(r => r.tipo === 'Uscite' && r.data).forEach(r => {
-      const v = parseFloat(String(r.costo).replace(',','.')) || 0;
+      const v = parseCosto(r.costo);
       spesaPerGiorno[r.data] = (spesaPerGiorno[r.data] || 0) + v;
     });
 
@@ -3139,11 +3143,33 @@
   });
 
   // ═══ CSV utils ═══════════════════════════════════════════════
+  // Ogni riga restituita porta .line = numero di riga nel file (per i report).
+  // Gestisce i campi tra virgolette ("Spesa, varie" o "12,50" con separatore ,)
   function csvParseText(text) {
-    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    if (!lines.length) return [];
-    const delim = (lines[0].match(/;/g) || []).length >= (lines[0].match(/,/g) || []).length ? ';' : ',';
-    return lines.map(l => l.split(delim).map(c => c.trim().replace(/^"(.*)"$/, '$1')));
+    const raw = text.replace(/^﻿/, '').split(/\r?\n/);
+    const first = raw.find(l => l.trim()) || '';
+    const delim = (first.match(/;/g) || []).length >= (first.match(/,/g) || []).length ? ';' : ',';
+    const out = [];
+    raw.forEach((l, i) => {
+      if (!l.trim()) return;
+      const cells = [];
+      let cur = '', q = false;
+      for (let j = 0; j < l.length; j++) {
+        const ch = l[j];
+        if (q) {
+          if (ch === '"' && l[j + 1] === '"') { cur += '"'; j++; }
+          else if (ch === '"') q = false;
+          else cur += ch;
+        } else if (ch === '"') q = true;
+        else if (ch === delim) { cells.push(cur.trim()); cur = ''; }
+        else cur += ch;
+      }
+      cells.push(cur.trim());
+      cells.line = i + 1;
+      cells.raw = l;
+      out.push(cells);
+    });
+    return out;
   }
 
   function csvDownload(filename, lines) {
@@ -3164,12 +3190,19 @@
     return null;
   }
 
-  // "1.234,56" | "1234.56" | "12,5" → numero
+  // "1.234,56" | "1234.56" | "12,5" | "1.850" | "€ 42" → numero (NaN se invalido)
   function parseImporto(s) {
-    s = String(s || '').trim().replace(/[€\s]/g, '');
+    s = String(s ?? '').trim().replace(/[€\s ]/g, '');
     if (!s) return NaN;
-    if (s.includes(',')) return parseFloat(s.replace(/\./g, '').replace(',', '.'));
+    if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+    else if (/^-?\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, ''); // solo separatori migliaia
+    if (!/^-?\d+(\.\d+)?$/.test(s)) return NaN;
     return parseFloat(s);
+  }
+
+  // Formato con cui i costi vengono salvati (it-IT, 2 decimali)
+  function fmtCostoStore(n) {
+    return n.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
   // ═══ Elenco spese: import / export CSV ═══════════════════════
@@ -3203,37 +3236,147 @@
     e.target.value = '';
     if (!file) return;
     const cells = csvParseText(await file.text());
-    if (!cells.length) { alert('File vuoto.'); return; }
+    csvReport = analizzaCsvSpese(cells, file.name);
+    renderCsvReport();
+    csvReportModal.style.display = 'flex';
+  });
 
-    let start = /data/i.test(cells[0][0]) ? 1 : 0;
-    const rows = [];
-    let scartate = 0;
+  // ─── Import: analisi riga per riga + modale di anteprima ──────
+  const csvReportModal = document.getElementById('csvReportModal');
+  let csvReport = null;
+
+  function analizzaCsvSpese(cells, fileName) {
+    const rep = { fileName, valide: [], scartate: [], totaleRighe: 0 };
+    if (!cells.length) return rep;
+    const start = /data/i.test(cells[0][0] || '') && isNaN(parseImporto(cells[0][1])) ? 1 : 0;
+    // Chiavi delle voci già presenti, per segnalare i doppioni
+    const keyOf = (data, costo, desc) => `${data}|${costo.toFixed(2)}|${desc.toLowerCase()}`;
+    const esistenti = new Set(allRows.map(r => keyOf(r.data, parseCosto(r.costo), String(r.descrizione || ''))));
+    const nelFile = new Set();
+
     for (let i = start; i < cells.length; i++) {
       const c = cells[i];
+      rep.totaleRighe++;
+      const errori = [];
       const dataIso = parseDataFlex(c[0]);
-      const costo   = parseImporto(c[1]);
-      const desc    = (c[2] || '').trim();
-      if (!dataIso || isNaN(costo) || !desc) { scartate++; continue; }
-      const d = new Date(dataIso);
-      const tipo = String(c[4] || '').trim().toLowerCase().startsWith('e') ? 'Entrate' : 'Uscite';
-      rows.push([
-        dataIso,
-        costo.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-        desc,
-        (c[3] || '').trim() || 'Altro',
-        tipo,
-        d.getMonth() + 1,
-        d.getFullYear(),
-      ]);
-    }
-    if (!rows.length) { alert('Nessuna riga valida trovata.\nColonne attese: Data;Costo;Descrizione;Categoria;Tipo'); return; }
-    if (!confirm(`Importare ${rows.length} voci?` + (scartate ? ` (${scartate} righe scartate)` : ''))) return;
+      if (!c[0]) errori.push('data mancante');
+      else if (!dataIso || !isDataValida(dataIso)) errori.push(`data non valida "${c[0]}"`);
+      let costo = parseImporto(c[1]);
+      if (!c[1]) errori.push('costo mancante');
+      else if (isNaN(costo)) errori.push(`costo non valido "${c[1]}"`);
+      const desc = (c[2] || '').trim();
+      if (!desc) errori.push('descrizione mancante');
+      if (c.length < 3) errori.push(`solo ${c.length} colonn${c.length === 1 ? 'a' : 'e'} (separatore errato?)`);
+      if (errori.length) { rep.scartate.push({ line: c.line, raw: c.raw, motivo: errori.join(', ') }); continue; }
 
+      const avvisi = [];
+      const tipoRaw = String(c[4] || '').trim().toLowerCase();
+      let tipo;
+      if (tipoRaw.startsWith('e')) tipo = 'Entrate';
+      else if (tipoRaw.startsWith('u')) tipo = 'Uscite';
+      else { tipo = 'Uscite'; avvisi.push(tipoRaw ? `tipo "${c[4]}" non riconosciuto → Uscite` : 'tipo mancante → Uscite'); }
+      if (costo < 0) { costo = Math.abs(costo); avvisi.push('importo negativo → reso positivo'); }
+      let cat = (c[3] || '').trim();
+      if (!cat) { cat = 'Altro'; avvisi.push('categoria mancante → Altro'); }
+      else if (!TUTTE_CAT.includes(cat)) {
+        const match = TUTTE_CAT.find(x => x.toLowerCase() === cat.toLowerCase());
+        if (match) cat = match; else avvisi.push(`categoria "${cat}" non presente nell'elenco`);
+      }
+      const k = keyOf(dataIso, costo, desc);
+      const duplicato = esistenti.has(k) ? 'già presente' : nelFile.has(k) ? 'ripetuta nel file' : '';
+      nelFile.add(k);
+      const [anno, mese] = dataIso.split('-').map(Number);
+      rep.valide.push({ line: c.line, data: dataIso, costo, desc, cat, tipo, anno, mese, avvisi, duplicato });
+    }
+    return rep;
+  }
+
+  function isDataValida(iso) {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    return y > 1900 && dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+  }
+
+  function csvRigheDaImportare() {
+    if (!csvReport) return [];
+    const skipDup = document.getElementById('csvSkipDup').checked;
+    return csvReport.valide.filter(v => !(skipDup && v.duplicato));
+  }
+
+  function renderCsvReport() {
+    const rep = csvReport;
+    const nDup = rep.valide.filter(v => v.duplicato).length;
+    const nAvv = rep.valide.filter(v => v.avvisi.length).length;
+    document.getElementById('csvRepFile').textContent = `${rep.fileName} — ${rep.totaleRighe} righe di dati`;
+    document.getElementById('csvSkipDupWrap').style.display = nDup ? '' : 'none';
+    document.getElementById('csvSkipDupLabel').textContent = `Escludi i possibili doppioni (${nDup})`;
+
+    const stat = (n, label, cls) => `<div class="csv-stat ${cls}"><span class="csv-stat-n">${n}</span><span class="csv-stat-l">${label}</span></div>`;
+    document.getElementById('csvRepStats').innerHTML =
+      stat(rep.valide.length, 'valide', 'ok') +
+      stat(rep.scartate.length, 'scartate', rep.scartate.length ? 'err' : '') +
+      stat(nAvv, 'con avvisi', nAvv ? 'warn' : '') +
+      stat(nDup, 'possibili doppioni', nDup ? 'warn' : '');
+
+    let html = '';
+    if (rep.scartate.length) {
+      html += `<p class="csv-rep-h err">Righe scartate (non verranno importate)</p>
+        <table class="csv-rep-table"><thead><tr><th>Riga</th><th>Motivo</th><th>Contenuto</th></tr></thead><tbody>` +
+        rep.scartate.map(s => `<tr class="err"><td>${s.line}</td><td>${escHtml(s.motivo)}</td><td class="csv-raw" title="${escHtml(s.raw)}">${escHtml(s.raw)}</td></tr>`).join('') +
+        '</tbody></table>';
+    }
+    if (rep.valide.length) {
+      html += `<p class="csv-rep-h">Righe valide</p>
+        <table class="csv-rep-table"><thead><tr><th>Riga</th><th>Data</th><th>Descrizione</th><th>Categoria</th><th>Tipo</th><th style="text-align:right">Costo</th></tr></thead><tbody>` +
+        rep.valide.map(v => {
+          const note = [...v.avvisi, ...(v.duplicato ? [`possibile doppione (${v.duplicato})`] : [])];
+          return `<tr class="${v.duplicato ? 'dup' : v.avvisi.length ? 'warn' : ''}">
+            <td>${v.line}</td><td>${formatDataDisplay(v.data)}</td>
+            <td title="${escHtml(v.desc)}">${escHtml(v.desc)}${note.length ? `<div class="csv-note">⚠ ${escHtml(note.join(' · '))}</div>` : ''}</td>
+            <td>${escHtml(v.cat)}</td><td>${v.tipo}</td>
+            <td style="text-align:right">${fmtEur(v.costo)}</td></tr>`;
+        }).join('') + '</tbody></table>';
+    }
+    if (!rep.totaleRighe) html = '<p class="csv-rep-empty">Il file non contiene righe di dati.</p>';
+    document.getElementById('csvRepBody').innerHTML = html;
+    document.getElementById('csvRepFeedback').className = 'form-feedback';
+    updateCsvImportBtn();
+  }
+
+  function updateCsvImportBtn() {
+    const n = csvRigheDaImportare().length;
+    const btn = document.getElementById('csvRepImporta');
+    btn.disabled = n === 0;
+    btn.textContent = n ? `Importa ${n} ${n === 1 ? 'voce' : 'voci'}` : 'Nessuna voce da importare';
+  }
+
+  document.getElementById('csvSkipDup').addEventListener('change', updateCsvImportBtn);
+  document.getElementById('csvRepAnnulla').addEventListener('click', () => { csvReportModal.style.display = 'none'; csvReport = null; });
+  document.getElementById('csvRepScarta').addEventListener('click', () => {
+    if (!csvReport?.scartate.length) { alert('Nessuna riga scartata.'); return; }
+    csvDownload('righe-scartate.csv', ['Riga;Motivo;Contenuto originale',
+      ...csvReport.scartate.map(s => [s.line, s.motivo.replace(/;/g, ','), '"' + s.raw.replace(/"/g, '""') + '"'].join(';'))]);
+  });
+
+  document.getElementById('csvRepImporta').addEventListener('click', async () => {
+    const righe = csvRigheDaImportare();
+    if (!righe.length) return;
+    const btn = document.getElementById('csvRepImporta');
+    const fb  = document.getElementById('csvRepFeedback');
+    btn.disabled = true; btn.textContent = 'Importazione…';
+    const rows = righe.map(v => [v.data, fmtCostoStore(v.costo), v.desc, v.cat, v.tipo, v.mese, v.anno]);
     const json = await asCall({ action: 'append_many', rows: JSON.stringify(rows) });
-    if (json.status !== 'ok') { alert('Errore durante l\'import: ' + json.message); return; }
-    allRows = [];
+    if (json.status !== 'ok') {
+      fb.textContent = '✗ Errore durante l\'import, nessuna voce salvata: ' + json.message;
+      fb.className = 'form-feedback visible error';
+      updateCsvImportBtn();
+      return;
+    }
+    csvReportModal.style.display = 'none';
+    csvReport = null;
     sessionStorage.removeItem(CACHE_KEY);
-    initApp(true).then(() => { populateAnnoFilter(); applyFilters(); });
+    await initApp(true);
+    alert(`✓ Importate ${righe.length} ${righe.length === 1 ? 'voce' : 'voci'}.`);
   });
 
   // ═══ Mutuo: configurazione + CSV ══════════════════════════════
