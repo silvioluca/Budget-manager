@@ -147,6 +147,26 @@
           return { status: 'ok' };
         }
 
+        // Azioni di gruppo: raggruppa per anno, 1 lettura + 1 scrittura per anno.
+        // params.ords = JSON array di ord; update_many applica params.fields
+        // (solo categoria/tipo: campi che non spostano la riga di anno).
+        case 'update_many':
+        case 'delete_many': {
+          const ords = new Set(JSON.parse(params.ords));
+          const fields = params.action === 'update_many' ? JSON.parse(params.fields) : null;
+          if (fields && Object.keys(fields).some(k => !['categoria','tipo'].includes(k))) throw new Error('campo non valido');
+          const anni = [...new Set(allRows.filter(r => ords.has(r.ord)).map(r => String(r.anno)))];
+          for (const anno of anni) {
+            const arr = await _annoLoad(db, base, anno);
+            const out = fields
+              ? arr.map(r => ords.has(r.ord) ? { ...r, ...fields } : r)
+              : arr.filter(r => !ords.has(r.ord));
+            await _annoSave(db, base, anno, out);
+          }
+          sessionStorage.removeItem(CACHE_KEY);
+          return { status: 'ok' };
+        }
+
         // Import CSV: raggruppa per anno, 1 lettura + 1 scrittura per anno
         case 'append_many': {
           const rows = JSON.parse(params.rows);
@@ -404,6 +424,9 @@
   let allRows = [];
   let sortDir = 'desc'; // default: più recente prima
   let deleteTarget = null;
+  let bulkDeletePending = false;
+  const selected = new Set(); // ord delle voci selezionate (stabile, a differenza di rowIndex)
+  let visibleRows = [];
 
   const speseBody    = document.getElementById('speseBody');
   const speseTable   = document.getElementById('speseTable');
@@ -538,9 +561,89 @@
       return sortDir === 'desc' ? db - da : da - db;
     });
 
+    // La selezione resta limitata alle voci visibili: un'azione di gruppo
+    // non deve mai toccare righe nascoste dai filtri
+    const visibili = new Set(filtered.map(r => r.ord));
+    [...selected].forEach(o => { if (!visibili.has(o)) selected.delete(o); });
+    visibleRows = filtered;
+
     elencoCount.textContent = `${filtered.length} ${filtered.length === 1 ? 'voce' : 'voci'}`;
     renderTable(filtered);
+    updateBulkBar();
   }
+
+  // ─── Controlli di gruppo ──────────────────────────────────────
+  const bulkBar      = document.getElementById('bulkBar');
+  const bulkCatEl    = document.getElementById('bulkCategoria');
+  const bulkTipoEl   = document.getElementById('bulkTipo');
+  const btnBulkApply = document.getElementById('btnBulkApply');
+  const chkAll       = document.getElementById('chkAll');
+  TUTTE_CAT.forEach(c => { const o = document.createElement('option'); o.value=c; o.textContent=c; bulkCatEl.appendChild(o); });
+
+  function updateBulkBar() {
+    const n = selected.size;
+    bulkBar.style.display = n ? 'flex' : 'none';
+    chkAll.checked = n > 0 && n === visibleRows.length;
+    chkAll.indeterminate = n > 0 && n < visibleRows.length;
+    if (!n) return;
+    const sel = visibleRows.filter(r => selected.has(r.ord));
+    // costo può essere "1.234,56" (it-IT) o "12.50"
+    const num = c => { c = String(c).trim(); return parseFloat(c.includes(',') ? c.replace(/\./g,'').replace(',','.') : c) || 0; };
+    const saldo = sel.reduce((s, r) => s + (r.tipo === 'Uscite' ? -1 : 1) * num(r.costo), 0);
+    document.getElementById('bulkCount').textContent = `${n} ${n === 1 ? 'selezionata' : 'selezionate'}`;
+    document.getElementById('bulkSum').textContent = `saldo ${saldo.toLocaleString('it-IT',{minimumFractionDigits:2,maximumFractionDigits:2})} €`;
+    btnBulkApply.disabled = !bulkCatEl.value && !bulkTipoEl.value;
+  }
+
+  chkAll.addEventListener('change', () => {
+    if (chkAll.checked) visibleRows.forEach(r => selected.add(r.ord));
+    else selected.clear();
+    speseBody.querySelectorAll('tr[data-ord]').forEach(tr => {
+      const on = selected.has(Number(tr.dataset.ord));
+      tr.classList.toggle('selected', on);
+      tr.querySelector('.row-check').checked = on;
+    });
+    updateBulkBar();
+  });
+
+  [bulkCatEl, bulkTipoEl].forEach(el => el.addEventListener('change', updateBulkBar));
+
+  document.getElementById('btnBulkClear').addEventListener('click', () => {
+    selected.clear();
+    applyFilters();
+  });
+
+  btnBulkApply.addEventListener('click', async () => {
+    const fields = {};
+    if (bulkCatEl.value)  fields.categoria = bulkCatEl.value;
+    if (bulkTipoEl.value) fields.tipo      = bulkTipoEl.value;
+    if (!selected.size || !Object.keys(fields).length) return;
+    const ords = [...selected];
+    btnBulkApply.disabled = true;
+    btnBulkApply.textContent = 'Salvataggio…';
+    try {
+      const json = await asCall({ action: 'update_many', ords: JSON.stringify(ords), fields: JSON.stringify(fields) });
+      if (json.status !== 'ok') throw new Error(json.message);
+      allRows.forEach(r => { if (selected.has(r.ord)) Object.assign(r, fields); });
+      bulkCatEl.value = ''; bulkTipoEl.value = '';
+      selected.clear();
+      applyFilters();
+    } catch(e) {
+      alert('Errore nel salvataggio. Riprova.');
+    } finally {
+      btnBulkApply.textContent = 'Applica';
+      updateBulkBar();
+    }
+  });
+
+  document.getElementById('btnBulkDelete').addEventListener('click', () => {
+    if (!selected.size) return;
+    bulkDeletePending = true;
+    deleteTarget = null;
+    document.getElementById('modalTitle').textContent = `Eliminare ${selected.size} ${selected.size === 1 ? 'voce' : 'voci'}?`;
+    modalDesc.textContent = document.getElementById('bulkSum').textContent + ' — operazione non annullabile';
+    deleteModal.style.display = 'flex';
+  });
 
   // Sort click sul th Data
   document.getElementById('thData').addEventListener('click', () => {
@@ -568,7 +671,10 @@
     rows.forEach(r => {
       const tr = document.createElement('tr');
       tr.dataset.rowIndex = r.rowIndex;
+      tr.dataset.ord = r.ord;
       const isUscita = r.tipo === 'Uscite';
+      const isSel = selected.has(r.ord);
+      if (isSel) tr.classList.add('selected');
 
       const actionsHtml = `
           <div class="td-actions">
@@ -581,6 +687,7 @@
           </div>`;
 
       tr.innerHTML = `
+        <td class="td-sel"><input type="checkbox" class="row-check" ${isSel ? 'checked' : ''}></td>
         <td>${formatDataDisplay(r.data)}</td>
         <td>${escHtml(r.descrizione)}</td>
         <td><span class="tag tag-neutral">${escHtml(r.categoria)}</span></td>
@@ -593,7 +700,7 @@
       const trD = document.createElement('tr');
       trD.className = 'm-detail';
       trD.innerHTML = `
-        <td colspan="3">
+        <td colspan="4">
           <div class="m-detail-row">
             <span class="m-detail-label">Descrizione</span>
             <span class="m-detail-val">${escHtml(r.descrizione)}</span>
@@ -606,9 +713,15 @@
         </td>`;
       speseBody.appendChild(trD);
 
+      tr.querySelector('.row-check').addEventListener('change', (e) => {
+        if (e.target.checked) selected.add(r.ord); else selected.delete(r.ord);
+        tr.classList.toggle('selected', e.target.checked);
+        updateBulkBar();
+      });
+
       tr.addEventListener('click', (e) => {
         if (!window.matchMedia('(max-width: 768px)').matches) return;
-        if (e.target.closest('button') || tr.classList.contains('editing')) return;
+        if (e.target.closest('button, .td-sel') || tr.classList.contains('editing')) return;
         tr.classList.toggle('m-open');
         trD.classList.toggle('m-visible');
       });
@@ -640,12 +753,13 @@
     const catOpts = allCat.map(c => `<option value="${c}" ${c===row.categoria?'selected':''}>${c}</option>`).join('');
     const tipoOpts = ['Uscite','Entrate'].map(t => `<option value="${t}" ${t===row.tipo?'selected':''}>${t}</option>`).join('');
 
-    tr.cells[0].innerHTML = `<input class="inline-input" id="ei-data-${rowIndex}" type="date" value="${row.data}" style="width:130px">`;
-    tr.cells[1].innerHTML = `<input class="inline-input" id="ei-desc-${rowIndex}" type="text" value="${escHtml(row.descrizione)}" style="min-width:140px">`;
-    tr.cells[2].innerHTML = `<select class="inline-select" id="ei-cat-${rowIndex}">${catOpts}</select>`;
-    tr.cells[3].innerHTML = `<select class="inline-select" id="ei-tipo-${rowIndex}">${tipoOpts}</select>`;
-    tr.cells[4].innerHTML = `<input class="inline-input" id="ei-costo-${rowIndex}" type="text" value="${row.costo}" style="width:80px;text-align:right">`;
-    tr.cells[5].innerHTML = `
+    // cells[0] = checkbox di selezione, resta invariata
+    tr.cells[1].innerHTML = `<input class="inline-input" id="ei-data-${rowIndex}" type="date" value="${row.data}" style="width:130px">`;
+    tr.cells[2].innerHTML = `<input class="inline-input" id="ei-desc-${rowIndex}" type="text" value="${escHtml(row.descrizione)}" style="min-width:140px">`;
+    tr.cells[3].innerHTML = `<select class="inline-select" id="ei-cat-${rowIndex}">${catOpts}</select>`;
+    tr.cells[4].innerHTML = `<select class="inline-select" id="ei-tipo-${rowIndex}">${tipoOpts}</select>`;
+    tr.cells[5].innerHTML = `<input class="inline-input" id="ei-costo-${rowIndex}" type="text" value="${row.costo}" style="width:80px;text-align:right">`;
+    tr.cells[6].innerHTML = `
       <div class="td-actions">
         <button class="btn-row save" title="Salva" onclick="saveEdit(${rowIndex})">
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 7l3.5 3.5L11 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -687,6 +801,8 @@
   window.askDelete = function(rowIndex) {
     const r = allRows.find(row => row.rowIndex === rowIndex);
     deleteTarget = rowIndex;
+    bulkDeletePending = false;
+    document.getElementById('modalTitle').textContent = 'Eliminare questa voce?';
     modalDesc.textContent = r ? `"${r.descrizione}" — ${r.costo} €` : '';
     deleteModal.style.display = 'flex';
   };
@@ -694,9 +810,26 @@
   document.getElementById('btnCancelDelete').addEventListener('click', () => {
     deleteModal.style.display = 'none';
     deleteTarget = null;
+    bulkDeletePending = false;
   });
 
   document.getElementById('btnConfirmDelete').addEventListener('click', async () => {
+    if (bulkDeletePending) {
+      bulkDeletePending = false;
+      deleteModal.style.display = 'none';
+      const ords = new Set(selected);
+      try {
+        const json = await asCall({ action: 'delete_many', ords: JSON.stringify([...ords]) });
+        if (json.status !== 'ok') throw new Error(json.message);
+        allRows = allRows.filter(r => !ords.has(r.ord));
+        allRows.forEach((r, i) => { r.rowIndex = i + 1; });
+        selected.clear();
+        applyFilters();
+      } catch(e) {
+        alert('Errore nell\'eliminazione. Riprova.');
+      }
+      return;
+    }
     if (!deleteTarget) return;
     const rowIndex = deleteTarget;
     deleteModal.style.display = 'none';

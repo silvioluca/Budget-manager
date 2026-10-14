@@ -314,6 +314,28 @@
         </div>
       </div>
 
+      <!-- Controlli di gruppo (visibili con almeno una voce selezionata) -->
+      <div class="bulk-bar" id="bulkBar" style="display:none;">
+        <div class="bulk-info">
+          <span class="bulk-count" id="bulkCount">0 selezionate</span>
+          <span class="bulk-sum" id="bulkSum"></span>
+        </div>
+        <div class="bulk-actions">
+          <select class="filter-select" id="bulkCategoria"><option value="">Cambia categoria…</option></select>
+          <select class="filter-select" id="bulkTipo">
+            <option value="">Cambia tipo…</option>
+            <option value="Uscite">Uscite</option>
+            <option value="Entrate">Entrate</option>
+          </select>
+          <button class="btn-reload" id="btnBulkApply" disabled>Applica</button>
+          <button class="btn-reload bulk-delete" id="btnBulkDelete">
+            <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 3.5h9M5 3.5V2.5h3v1M4 3.5l.5 7h4l.5-7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Elimina
+          </button>
+          <button class="btn-clear-filters" id="btnBulkClear">Deseleziona</button>
+        </div>
+      </div>
+
       <!-- Tabella -->
       <div class="table-wrap" id="tableWrap">
         <div class="table-loading" id="tableLoading">
@@ -325,6 +347,7 @@
         </div>
         <table class="spese-table" id="speseTable" style="display:none;">
           <colgroup>
+            <col class="col-sel">
             <col class="col-data">
             <col class="col-descrizione">
             <col class="col-categoria">
@@ -334,6 +357,7 @@
           </colgroup>
           <thead>
             <tr>
+              <th class="th-sel"><input type="checkbox" class="row-check" id="chkAll" title="Seleziona tutte le voci filtrate"></th>
               <th class="th-sortable sort-desc" id="thData">
                 Data <span class="sort-icon">
                   <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M4.5 1v7M1.5 5l3 3 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1162,7 +1186,7 @@
 <!-- Modal eliminazione — fuori dal layout per evitare conflitti con position:fixed -->
 <div class="modal-overlay" id="deleteModal" style="display:none;">
   <div class="modal-box">
-    <p class="modal-title">Eliminare questa voce?</p>
+    <p class="modal-title" id="modalTitle">Eliminare questa voce?</p>
     <p class="modal-sub" id="modalDesc"></p>
     <div class="modal-actions">
       <button class="btn-reset" id="btnCancelDelete">Annulla</button>
