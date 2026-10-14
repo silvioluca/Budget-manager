@@ -575,7 +575,7 @@
 
   function updateBulkBar() {
     const n = selected.size;
-    bulkBar.classList.toggle('hidden', n === 0);
+    bulkBar.hidden = n === 0;
     const allSel = visibleRows.length > 0 && visibleRows.every(r => selected.has(r.ord));
     const btnAll = document.getElementById('btnBulkAll');
     btnAll.classList.toggle('active', allSel);

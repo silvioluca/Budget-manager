@@ -7,7 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600&family=Space+Mono:wght@700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<!-- ?v= da aggiornare a ogni rilascio: evita che il browser usi JS/CSS vecchi con l'HTML nuovo -->
+<link rel="stylesheet" href="style.css?v=20261014b">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 
@@ -315,7 +316,7 @@
       </div>
 
       <!-- Barra azioni flottante (come School-manager): compare con almeno una voce selezionata -->
-      <div class="floating-bulk-bar hidden" id="bulkBar">
+      <div class="floating-bulk-bar" id="bulkBar" hidden>
         <span class="bulk-count" id="bulkCount"></span>
         <span class="bulk-sum" id="bulkSum"></span>
         <span class="bulk-sep"></span>
@@ -1267,5 +1268,5 @@
     }
   });
 </script>
-<script src="app.js"></script>
+<script src="app.js?v=20261014b"></script>
 </html>
